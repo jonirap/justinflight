@@ -1,0 +1,15 @@
+services:
+  justinflight:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - flight-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  flight-data:
