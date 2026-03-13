@@ -7,7 +7,13 @@ from zoneinfo import ZoneInfo
 from config import CHECK_INTERVAL_MINUTES, DAYS_AHEAD, LOG_LEVEL
 from dedup import DedupTracker
 from models import FlightResult
-from notifier import notify_flights, send_startup_message
+from notifier import (
+    _escape_markdown_v2,
+    get_chat_ids,
+    notify_flights_to_chat,
+    send_message,
+    send_startup_message,
+)
 from scrapers import IsstaScraper
 
 TZ = ZoneInfo("Asia/Jerusalem")
@@ -35,7 +41,7 @@ async def run_check(dedup: DedupTracker, failure_counts: dict[str, int]) -> None
         IsstaScraper(),
     ]
 
-    all_new_flights: list[FlightResult] = []
+    all_flights: list[FlightResult] = []
 
     for scraper in scrapers:
         name = scraper.airline_name
@@ -43,15 +49,8 @@ async def run_check(dedup: DedupTracker, failure_counts: dict[str, int]) -> None
             logger.info("Running %s scraper...", name)
             flights = await scraper.search_flights(dates)
             logger.info("%s scraper returned %d flight(s)", name, len(flights))
-
-            # Reset failure counter on success
             failure_counts[name] = 0
-
-            # Filter to only new flights
-            for flight in flights:
-                if dedup.is_new(flight):
-                    all_new_flights.append(flight)
-                    dedup.mark_notified(flight)
+            all_flights.extend(flights)
 
         except Exception:
             logger.exception("%s scraper failed", name)
@@ -62,20 +61,35 @@ async def run_check(dedup: DedupTracker, failure_counts: dict[str, int]) -> None
                     "%s scraper has failed %d consecutive times — sending alert",
                     name, failure_counts[name],
                 )
-                from notifier import send_message, _escape_markdown_v2
                 msg = _escape_markdown_v2(
                     f"Warning: {name} scraper has failed 5 consecutive times. "
                     "Check logs for details."
                 )
                 send_message(msg)
 
-    if all_new_flights:
-        logger.info("Notifying about %d new flight(s)", len(all_new_flights))
-        notify_flights(all_new_flights)
-    else:
-        logger.info("No new flights found this cycle")
+    if not all_flights:
+        logger.info("No flights found this cycle")
+        dedup.cleanup_old()
+        return
 
-    # Clean up old dedup entries
+    # Per-chat dedup: each chat gets flights it hasn't seen yet
+    chat_ids = get_chat_ids()
+    if not chat_ids:
+        logger.warning("No chat IDs registered, skipping notifications")
+        dedup.cleanup_old()
+        return
+
+    for chat_id in chat_ids:
+        new_for_chat = [f for f in all_flights if dedup.is_new(f, chat_id)]
+        if new_for_chat:
+            logger.info(
+                "Notifying chat %s about %d new flight(s)", chat_id, len(new_for_chat),
+            )
+            notify_flights_to_chat(new_for_chat, chat_id)
+            for flight in new_for_chat:
+                dedup.mark_notified(flight, chat_id)
+
+    dedup.save()
     dedup.cleanup_old()
 
 

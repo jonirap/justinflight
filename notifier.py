@@ -135,12 +135,8 @@ def send_message(text: str) -> None:
         _send_to_chat(chat_id, text)
 
 
-def notify_flights(flights: list) -> None:
-    """Format a list of FlightResult objects into a batched Telegram message and send it."""
-    if not flights:
-        logger.info("No flights to notify about.")
-        return
-
+def _format_flights_message(flights: list) -> str:
+    """Format a list of FlightResult objects into a Telegram message."""
     blocks = []
     for flight in flights:
         airline = _escape_markdown_v2(flight.airline)
@@ -162,8 +158,29 @@ def notify_flights(flights: list) -> None:
         blocks.append("\n".join(lines))
 
     header = _escape_markdown_v2("New flights found!")
-    message = f"*{header}*\n\n" + "\n\n".join(blocks)
+    return f"*{header}*\n\n" + "\n\n".join(blocks)
 
+
+def get_chat_ids() -> set[str]:
+    """Poll for new chats and return all registered chat IDs."""
+    _poll_new_chats()
+    return _load_chat_ids()
+
+
+def notify_flights_to_chat(flights: list, chat_id: str) -> None:
+    """Send flight notifications to a specific chat."""
+    if not flights:
+        return
+    message = _format_flights_message(flights)
+    _send_to_chat(chat_id, message)
+
+
+def notify_flights(flights: list) -> None:
+    """Format a list of FlightResult objects into a Telegram message and send to all chats."""
+    if not flights:
+        logger.info("No flights to notify about.")
+        return
+    message = _format_flights_message(flights)
     send_message(message)
 
 
