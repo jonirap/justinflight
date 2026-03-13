@@ -17,6 +17,10 @@ RESULTS_URL = (
     "&dport=tlv&aport=lca&dtime=-1&class=y&flighttype=0"
 )
 
+ADDITIONAL_FLIGHTS_URL = (
+    "https://www.issta.co.il/flights/getadditionalflights"
+)
+
 CALENDAR_URL = (
     "https://external.issta.co.il/products/api/flights/calendardates"
     "?destinationCode=LCA&from=null"
@@ -124,7 +128,53 @@ class IsstaScraper(BaseScraper):
         resp.raise_for_status()
         html = resp.text
 
-        return self._parse_results_html(html, date_iso, url)
+        results = self._parse_results_html(html, date_iso, url)
+
+        # Issta groups flights: only the first is in the initial HTML,
+        # the rest are loaded via AJAX. Fetch them too.
+        additional = self._fetch_additional_flights(html, date_iso, url)
+        results.extend(additional)
+
+        return results
+
+    def _fetch_additional_flights(
+        self, html: str, date_iso: str, url: str,
+    ) -> List[FlightResult]:
+        """Fetch grouped flights hidden behind the 'show more' button."""
+        # Extract session key
+        sid_match = re.search(r'name="sid"[^>]*value="([^"]+)"', html)
+        if not sid_match:
+            return []
+        session_key = sid_match.group(1)
+
+        # Extract flight IDs from hidden-items containers
+        flight_ids = re.findall(r'data-flightid="([^"]+)"', html)
+        if not flight_ids:
+            return []
+
+        results: List[FlightResult] = []
+        for fid in flight_ids:
+            try:
+                resp = requests.post(
+                    ADDITIONAL_FLIGHTS_URL,
+                    data={"sessionKey": session_key, "flightId": fid},
+                    headers={**HEADERS, "Referer": url},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                additional = self._parse_results_html(resp.text, date_iso, url)
+                logger.info(
+                    "Fetched %d additional flight(s) for %s (flightId=%s)",
+                    len(additional), date_iso, fid,
+                )
+                results.extend(additional)
+            except Exception:
+                logger.exception(
+                    "Error fetching additional flights for %s (flightId=%s)",
+                    date_iso, fid,
+                )
+
+        return results
 
     def _parse_results_html(
         self, html: str, date_iso: str, url: str,
@@ -149,6 +199,7 @@ class IsstaScraper(BaseScraper):
             airline = None
             dep_time = None
             price = None
+            seats_left = None
 
             for i, t in enumerate(texts):
                 # Find airline name (first occurrence only)
@@ -166,6 +217,12 @@ class IsstaScraper(BaseScraper):
                 # Find price: look for "סה"כ לתשלום:" followed by "$NNN"
                 if price is None and re.match(r"^\$\d+", t):
                     price = t
+
+                # Find seats remaining: "N מקומות אחרונים"
+                if seats_left is None:
+                    seats_match = re.match(r"^(\d+)\s+מקומות", t)
+                    if seats_match:
+                        seats_left = seats_match.group(1)
 
             # Also try: "$" as separate token followed by number
             if price is None:
@@ -198,6 +255,7 @@ class IsstaScraper(BaseScraper):
                 departure_time=dep_time,
                 price=price,
                 flight_number=None,
+                seats_left=seats_left,
                 url=url,
             )
             results.append(flight)

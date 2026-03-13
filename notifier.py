@@ -80,6 +80,8 @@ def notify_flights(flights: list) -> None:
             lines.append(f"Time: {_escape_markdown_v2(flight.departure_time)}")
         if flight.price:
             lines.append(f"Price: {_escape_markdown_v2(flight.price)}")
+        if flight.seats_left:
+            lines.append(f"Seats left: {_escape_markdown_v2(flight.seats_left)}")
         if flight.url:
             lines.append(f"Link: {_escape_markdown_v2(flight.url)}")
 

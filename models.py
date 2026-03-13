@@ -11,6 +11,7 @@ class FlightResult:
     departure_time: Optional[str] = None
     price: Optional[str] = None
     flight_number: Optional[str] = None
+    seats_left: Optional[str] = None
     url: Optional[str] = None
 
     @property
