@@ -11,19 +11,8 @@ from scrapers.base import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-RESULTS_URL = (
-    "https://www.issta.co.il/flights/results.aspx"
-    "?route=1&padt=1&pchd=0&pinf=0&pyou=0"
-    "&dport=tlv&aport=lca&dtime=-1&class=y&flighttype=0"
-)
-
 ADDITIONAL_FLIGHTS_URL = (
     "https://www.issta.co.il/flights/getadditionalflights"
-)
-
-CALENDAR_URL = (
-    "https://external.issta.co.il/products/api/flights/calendardates"
-    "?destinationCode=LCA&from=null"
 )
 
 HEADERS = {
@@ -49,7 +38,7 @@ class _TextExtractor(HTMLParser):
 
 
 class IsstaScraper(BaseScraper):
-    """Scrape Issta.co.il search results for one-way TLV->LCA flights.
+    """Scrape Issta.co.il search results for one-way TLV flights.
 
     The Issta results page is server-side rendered and returns full flight
     data in the HTML without requiring JavaScript execution. We use the
@@ -58,6 +47,19 @@ class IsstaScraper(BaseScraper):
     """
 
     airline_name = "Issta"
+
+    def __init__(self, destination: str = "LCA"):
+        super().__init__(destination)
+        dest_lower = self.destination.lower()
+        self._results_url = (
+            "https://www.issta.co.il/flights/results.aspx"
+            f"?route=1&padt=1&pchd=0&pinf=0&pyou=0"
+            f"&dport=tlv&aport={dest_lower}&dtime=-1&class=y&flighttype=0"
+        )
+        self._calendar_url = (
+            "https://external.issta.co.il/products/api/flights/calendardates"
+            f"?destinationCode={self.destination}&from=null"
+        )
 
     async def search_flights(self, dates: List[str]) -> List[FlightResult]:
         results: List[FlightResult] = []
@@ -100,7 +102,7 @@ class IsstaScraper(BaseScraper):
     def _get_available_dates(self) -> set[str]:
         """Query Issta calendar API to find dates with flight availability."""
         try:
-            resp = requests.get(CALENDAR_URL, headers=HEADERS, timeout=15)
+            resp = requests.get(self._calendar_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -121,7 +123,7 @@ class IsstaScraper(BaseScraper):
         dt = datetime.strptime(date_iso, "%Y-%m-%d")
         fdate = dt.strftime("%d/%m/%Y")
 
-        url = f"{RESULTS_URL}&fdate={fdate}"
+        url = f"{self._results_url}&fdate={fdate}"
         logger.info("Fetching Issta results for %s", date_iso)
 
         resp = requests.get(url, headers=HEADERS, timeout=30)
@@ -250,7 +252,7 @@ class IsstaScraper(BaseScraper):
             flight = FlightResult(
                 airline=airline,
                 origin="TLV",
-                destination="LCA",
+                destination=self.destination,
                 date=date_iso,
                 departure_time=dep_time,
                 price=price,

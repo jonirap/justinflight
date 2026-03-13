@@ -9,6 +9,9 @@ class BaseScraper(ABC):
 
     airline_name: str = ""
 
+    def __init__(self, destination: str = "LCA"):
+        self.destination = destination.upper()
+
     @abstractmethod
     async def search_flights(self, dates: List[str]) -> List[FlightResult]:
         """Search for available flights on the given dates.

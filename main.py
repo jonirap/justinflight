@@ -1,22 +1,13 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-from config import CHECK_INTERVAL_MINUTES, DAYS_AHEAD, LOG_LEVEL
+from config import CHECK_INTERVAL_MINUTES, LOG_LEVEL, generate_rolling_dates
 from dedup import DedupTracker
 from models import FlightResult
-from notifier import (
-    _escape_markdown_v2,
-    get_chat_ids,
-    notify_flights_to_chat,
-    send_message,
-    send_startup_message,
-)
+from notifier import escape_markdown_v2, notify_flights_to_chat, send_to_chat
+from preferences import UserPreferences
 from scrapers import IsstaScraper
-
-TZ = ZoneInfo("Asia/Jerusalem")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -26,67 +17,92 @@ logging.basicConfig(
 logger = logging.getLogger("justinflight")
 
 
-def generate_dates() -> list[str]:
-    """Return the next DAYS_AHEAD dates in YYYY-MM-DD format (Jerusalem timezone)."""
-    today = datetime.now(TZ).date()
-    return [(today + timedelta(days=d)).isoformat() for d in range(DAYS_AHEAD)]
+def _scrape_destination(dest: str, dates: list[str]) -> list[FlightResult]:
+    """Run scraper synchronously (called via asyncio.to_thread)."""
+    scraper = IsstaScraper(dest)
+    # search_flights is declared async but uses sync requests internally,
+    # so we run it in a thread. Call the underlying sync logic directly.
+    import asyncio
+    return asyncio.run(scraper.search_flights(dates))
 
 
-async def run_check(dedup: DedupTracker, failure_counts: dict[str, int]) -> None:
-    """Run a single check cycle across all scrapers."""
-    dates = generate_dates()
-    logger.info("Checking dates: %s", ", ".join(dates))
+async def run_check(
+    preferences: UserPreferences,
+    dedup: DedupTracker,
+    failure_counts: dict[str, int],
+) -> None:
+    """Run a single check cycle across all user-subscribed destinations."""
+    rolling_dates = generate_rolling_dates()
+    wanted_dests = preferences.get_all_wanted_destinations()
 
-    scrapers = [
-        IsstaScraper(),
-    ]
+    if not wanted_dests:
+        logger.info("No destinations subscribed by any user, skipping check")
+        return
 
-    all_flights: list[FlightResult] = []
+    logger.info("Checking %d destination(s): %s", len(wanted_dests), ", ".join(sorted(wanted_dests)))
 
-    for scraper in scrapers:
-        name = scraper.airline_name
+    # Scrape each destination (in a thread to avoid blocking the event loop)
+    dest_flights: dict[str, list[FlightResult]] = {}
+    for dest in sorted(wanted_dests):
+        scraper_key = f"Issta-{dest}"
         try:
-            logger.info("Running %s scraper...", name)
-            flights = await scraper.search_flights(dates)
-            logger.info("%s scraper returned %d flight(s)", name, len(flights))
-            failure_counts[name] = 0
-            all_flights.extend(flights)
+            # Compute union of dates across all users wanting this destination
+            users = preferences.get_users_for_destination(dest)
+            all_dates: set[str] = set()
+            for uid in users:
+                all_dates.update(preferences.get_dates_for_user(uid, rolling_dates))
+            dates = sorted(all_dates)
+
+            if not dates:
+                continue
+
+            logger.info("Running scraper for %s with %d date(s)", dest, len(dates))
+            flights = await asyncio.to_thread(_scrape_destination, dest, dates)
+            logger.info("%s returned %d flight(s)", scraper_key, len(flights))
+            dest_flights[dest] = flights
+            failure_counts[scraper_key] = 0
 
         except Exception:
-            logger.exception("%s scraper failed", name)
-            failure_counts[name] = failure_counts.get(name, 0) + 1
+            logger.exception("Scraper failed for %s", dest)
+            failure_counts[scraper_key] = failure_counts.get(scraper_key, 0) + 1
 
-            if failure_counts[name] == 5:
+            if failure_counts[scraper_key] == 5:
                 logger.warning(
-                    "%s scraper has failed %d consecutive times — sending alert",
-                    name, failure_counts[name],
+                    "%s scraper has failed 5 consecutive times", scraper_key,
                 )
-                msg = _escape_markdown_v2(
-                    f"Warning: {name} scraper has failed 5 consecutive times. "
+                # Notify all users subscribed to this destination
+                users = preferences.get_users_for_destination(dest)
+                msg = escape_markdown_v2(
+                    f"Warning: scraper for {dest} has failed 5 consecutive times. "
                     "Check logs for details."
                 )
-                send_message(msg)
+                for uid in users:
+                    await asyncio.to_thread(send_to_chat, uid, msg)
 
-    if not all_flights:
-        logger.info("No flights found this cycle")
-        dedup.cleanup_old()
-        return
+    # Per-user notification with dedup
+    all_chat_ids = preferences.get_all_chat_ids()
+    for chat_id in all_chat_ids:
+        user_prefs = preferences.get_user_prefs(chat_id)
+        if not user_prefs:
+            continue
+        user_dests = user_prefs.get("destinations", [])
+        user_dates = set(preferences.get_dates_for_user(chat_id, rolling_dates))
 
-    # Per-chat dedup: each chat gets flights it hasn't seen yet
-    chat_ids = get_chat_ids()
-    if not chat_ids:
-        logger.warning("No chat IDs registered, skipping notifications")
-        dedup.cleanup_old()
-        return
+        # Collect flights matching this user's destinations and dates
+        user_flights = []
+        for dest in user_dests:
+            for flight in dest_flights.get(dest, []):
+                if flight.date in user_dates:
+                    user_flights.append(flight)
 
-    for chat_id in chat_ids:
-        new_for_chat = [f for f in all_flights if dedup.is_new(f, chat_id)]
-        if new_for_chat:
+        # Filter through dedup
+        new_flights = [f for f in user_flights if dedup.is_new(f, chat_id)]
+        if new_flights:
             logger.info(
-                "Notifying chat %s about %d new flight(s)", chat_id, len(new_for_chat),
+                "Notifying chat %s about %d new flight(s)", chat_id, len(new_flights),
             )
-            notify_flights_to_chat(new_for_chat, chat_id)
-            for flight in new_for_chat:
+            await asyncio.to_thread(notify_flights_to_chat, new_flights, chat_id)
+            for flight in new_flights:
                 dedup.mark_notified(flight, chat_id)
 
     dedup.save()
@@ -95,19 +111,35 @@ async def run_check(dedup: DedupTracker, failure_counts: dict[str, int]) -> None
 
 async def main() -> None:
     logger.info("JustInFlight bot starting up")
-    send_startup_message()
 
+    preferences = UserPreferences()
     dedup = DedupTracker()
     failure_counts: dict[str, int] = {}
 
-    while True:
-        try:
-            await run_check(dedup, failure_counts)
-        except Exception:
-            logger.exception("Unexpected error in check cycle")
+    # Import here to avoid circular imports at module level
+    from bot import create_bot_app
 
-        logger.info("Sleeping for %d minutes", CHECK_INTERVAL_MINUTES)
-        await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+    bot_app = create_bot_app(preferences, dedup)
+    await bot_app.initialize()
+    await bot_app.start()
+    await bot_app.updater.start_polling()
+
+    logger.info("Bot polling started, entering scraper loop")
+
+    try:
+        while True:
+            try:
+                await run_check(preferences, dedup, failure_counts)
+            except Exception:
+                logger.exception("Unexpected error in check cycle")
+
+            logger.info("Sleeping for %d minutes", CHECK_INTERVAL_MINUTES)
+            await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+    finally:
+        logger.info("Shutting down bot...")
+        await bot_app.updater.stop()
+        await bot_app.stop()
+        await bot_app.shutdown()
 
 
 if __name__ == "__main__":

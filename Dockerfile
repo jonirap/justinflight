@@ -7,10 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN groupadd -r botuser && useradd -r -g botuser -d /app -s /sbin/nologin botuser \
-    && mkdir -p /app/data \
-    && chown -R botuser:botuser /app
-
-USER botuser
+RUN mkdir -p /app/data
 
 CMD ["python", "-u", "main.py"]
