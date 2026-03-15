@@ -17,13 +17,17 @@ logging.basicConfig(
 logger = logging.getLogger("justinflight")
 
 
-def _scrape_destination(dest: str, dates: list[str]) -> list[FlightResult]:
-    """Run scraper synchronously (called via asyncio.to_thread)."""
+def _scrape_destination(dest: str, dates: list[str]) -> tuple[list[FlightResult], bool]:
+    """Run scraper synchronously (called via asyncio.to_thread).
+
+    Returns (flights, sanity_ok) where sanity_ok indicates whether the
+    parser sanity check passed.
+    """
     scraper = IsstaScraper(dest)
-    # search_flights is declared async but uses sync requests internally,
-    # so we run it in a thread. Call the underlying sync logic directly.
     import asyncio
-    return asyncio.run(scraper.search_flights(dates))
+    flights = asyncio.run(scraper.search_flights(dates))
+    sanity_ok = scraper.sanity_check()
+    return flights, sanity_ok
 
 
 async def run_check(
@@ -57,10 +61,28 @@ async def run_check(
                 continue
 
             logger.info("Running scraper for %s with %d date(s)", dest, len(dates))
-            flights = await asyncio.to_thread(_scrape_destination, dest, dates)
+            flights, sanity_ok = await asyncio.to_thread(_scrape_destination, dest, dates)
             logger.info("%s returned %d flight(s)", scraper_key, len(flights))
             dest_flights[dest] = flights
             failure_counts[scraper_key] = 0
+
+            if not sanity_ok:
+                sanity_key = f"sanity-{dest}"
+                failure_counts[sanity_key] = failure_counts.get(sanity_key, 0) + 1
+                if failure_counts[sanity_key] == 3:
+                    logger.error(
+                        "Sanity check for %s has failed 3 consecutive times", dest,
+                    )
+                    users = preferences.get_users_for_destination(dest)
+                    msg = escape_markdown_v2(
+                        f"Warning: Issta parser sanity check for {dest} has "
+                        "failed 3 times in a row. The site may have changed "
+                        "its HTML structure. Flights may be missed."
+                    )
+                    for uid in users:
+                        await asyncio.to_thread(send_to_chat, uid, msg)
+            else:
+                failure_counts[f"sanity-{dest}"] = 0
 
         except Exception:
             logger.exception("Scraper failed for %s", dest)

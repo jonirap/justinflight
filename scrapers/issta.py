@@ -234,6 +234,100 @@ class IsstaScraper(BaseScraper):
 
         return all_results
 
+    def sanity_check(self) -> bool:
+        """Verify the scraper can still parse flights from Issta.
+
+        Picks a date ~30 days out from the calendar API (likely to have many
+        flights) and checks that we can parse at least one flight with an
+        airline name and a price from the TLV results page.  Returns True if
+        parsing works, False otherwise.
+        """
+        available = sorted(self._get_available_dates())
+        if not available:
+            logger.error("Sanity check: calendar API returned no dates")
+            return False
+
+        # Pick a date ~30 days out for best availability
+        target = None
+        for d in available:
+            if d >= available[min(30, len(available) - 1)]:
+                target = d
+                break
+        if target is None:
+            target = available[-1]
+
+        logger.info("Sanity check: probing %s from TLV", target)
+
+        # Ensure we have Radware cookies
+        if not self._cookies:
+            logger.error("Sanity check: no Radware cookies available")
+            return False
+
+        dt = datetime.strptime(target, "%Y-%m-%d")
+        fdate = dt.strftime("%d/%m/%Y")
+        url = (
+            f"{self._results_url_template.format(origin='tlv')}"
+            f"&fdate={fdate}"
+        )
+
+        session = cffi_requests.Session(impersonate="chrome120")
+        for name, value in self._cookies.items():
+            session.cookies.set(name, value, domain="www.issta.co.il")
+
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 247:
+                logger.error("Sanity check: got Radware challenge (cookies expired)")
+                self._cookies = None
+                return False
+            resp.raise_for_status()
+        except Exception:
+            logger.exception("Sanity check: failed to fetch results page")
+            return False
+
+        html = resp.text
+
+        # Check 1: the page has list-item blocks (HTML structure intact)
+        blocks = html.split('class="list-item ')
+        total_blocks = len(blocks) - 1
+        if total_blocks == 0:
+            logger.error(
+                "Sanity check FAILED: no list-item blocks found on %s "
+                "(HTML structure may have changed, page length=%d)",
+                target, len(html),
+            )
+            return False
+
+        # Check 2: we can extract at least one flight with airline + price
+        # (using ANY airline, not just wanted ones)
+        parsed_any = False
+        for block in blocks[1:]:
+            parser = _TextExtractor()
+            try:
+                parser.feed(block[:8000])
+            except Exception:
+                continue
+            texts = parser.texts
+            has_time = any(re.match(r"^\d{1,2}:\d{2}$", t) for t in texts)
+            has_price = any(re.match(r"^\$\d+", t) for t in texts)
+            if has_time and has_price:
+                parsed_any = True
+                break
+
+        if not parsed_any:
+            logger.error(
+                "Sanity check FAILED: found %d list-item blocks on %s "
+                "but could not extract time+price from any "
+                "(parsing logic may be broken)",
+                total_blocks, target,
+            )
+            return False
+
+        logger.info(
+            "Sanity check OK: %d flight blocks parsed on %s", total_blocks, target,
+        )
+        return True
+
     def _parse_results_html(
         self, html: str, date_iso: str, url: str, origin: str = "TLV",
     ) -> List[FlightResult]:
