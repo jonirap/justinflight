@@ -7,3 +7,5 @@ __pycache__
 *.md
 .claude/
 data/
+node_modules/
+package*.json

@@ -12,3 +12,5 @@ venv/
 data/
 *.png
 .claude/
+node_modules/
+package*.json
