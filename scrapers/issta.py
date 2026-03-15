@@ -109,6 +109,10 @@ class IsstaScraper(BaseScraper):
 
     airline_name = "Issta"
 
+    # Class-level cookie cache shared across all instances so Firefox only
+    # needs to solve the Radware challenge once per process, not per destination.
+    _cookies: Optional[Dict[str, str]] = None
+
     def __init__(self, destination: str = "LCA"):
         super().__init__(destination)
         dest_lower = self.destination.lower()
@@ -121,7 +125,6 @@ class IsstaScraper(BaseScraper):
         self._calendar_url = (
             f"{CALENDAR_URL}?destinationCode={self.destination}&from=null"
         )
-        self._cookies: Optional[Dict[str, str]] = None
 
     async def search_flights(self, dates: List[str]) -> List[FlightResult]:
         results: List[FlightResult] = []
@@ -144,9 +147,9 @@ class IsstaScraper(BaseScraper):
         )
 
         # Obtain Radware cookies if we don't have them yet
-        if not self._cookies:
+        if not IsstaScraper._cookies:
             try:
-                self._cookies = await _obtain_radware_cookies()
+                IsstaScraper._cookies = await _obtain_radware_cookies()
             except Exception:
                 logger.exception("Failed to obtain Radware cookies")
                 return results
@@ -183,8 +186,12 @@ class IsstaScraper(BaseScraper):
             logger.exception("Failed to fetch Issta calendar")
             return set()
 
+        if not data or not isinstance(data, dict):
+            logger.warning("Issta calendar returned empty/invalid response for %s", self.destination)
+            return set()
+
         dates = set()
-        for entry in data.get("Dates", []):
+        for entry in data.get("Dates") or []:
             raw = entry.get("Date", "")
             if raw:
                 dates.add(raw[:10])  # YYYY-MM-DD
@@ -217,7 +224,7 @@ class IsstaScraper(BaseScraper):
                         "Radware challenge on %s (cookies may have expired)",
                         origin.upper(),
                     )
-                    self._cookies = None  # Force re-auth next time
+                    IsstaScraper._cookies = None  # Force re-auth next time
                     continue
                 resp.raise_for_status()
             except Exception:
@@ -259,7 +266,7 @@ class IsstaScraper(BaseScraper):
         logger.info("Sanity check: probing %s from TLV", target)
 
         # Ensure we have Radware cookies
-        if not self._cookies:
+        if not IsstaScraper._cookies:
             logger.error("Sanity check: no Radware cookies available")
             return False
 
@@ -271,14 +278,14 @@ class IsstaScraper(BaseScraper):
         )
 
         session = cffi_requests.Session(impersonate="chrome120")
-        for name, value in self._cookies.items():
+        for name, value in IsstaScraper._cookies.items():
             session.cookies.set(name, value, domain="www.issta.co.il")
 
         try:
             resp = session.get(url, timeout=30)
             if resp.status_code == 247:
                 logger.error("Sanity check: got Radware challenge (cookies expired)")
-                self._cookies = None
+                IsstaScraper._cookies = None
                 return False
             resp.raise_for_status()
         except Exception:
