@@ -30,7 +30,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Welcome to JustInFlight!\n\n"
         "I monitor flight availability from TLV (Tel Aviv) "
-        "for Israeli airlines (Israir, Arkia, El Al).\n\n"
+        "for Israeli airlines (Israir, Arkia, El Al, airHaifa).\n\n"
         "You're subscribed to: Larnaca (LCA) by default.\n\n"
         "Commands:\n"
         "/destinations - list available destinations\n"

@@ -23,7 +23,9 @@ HEADERS = {
     ),
 }
 
-WANTED_AIRLINES = {"israir", "arkia", "el al"}
+WANTED_AIRLINES = {"israir", "arkia", "el al", "airhaifa"}
+
+ORIGINS = ["tlv", "hfa"]
 
 
 class _TextExtractor(HTMLParser):
@@ -38,7 +40,7 @@ class _TextExtractor(HTMLParser):
 
 
 class IsstaScraper(BaseScraper):
-    """Scrape Issta.co.il search results for one-way TLV flights.
+    """Scrape Issta.co.il search results for one-way TLV/HFA flights.
 
     The Issta results page is server-side rendered and returns full flight
     data in the HTML without requiring JavaScript execution. We use the
@@ -51,10 +53,10 @@ class IsstaScraper(BaseScraper):
     def __init__(self, destination: str = "LCA"):
         super().__init__(destination)
         dest_lower = self.destination.lower()
-        self._results_url = (
+        self._results_url_template = (
             "https://www.issta.co.il/flights/results.aspx"
-            f"?route=1&padt=1&pchd=0&pinf=0&pyou=0"
-            f"&dport=tlv&aport={dest_lower}&dtime=-1&class=y&flighttype=0"
+            "?route=1&padt=1&pchd=0&pinf=0&pyou=0"
+            "&dport={origin}&aport=" + dest_lower + "&dtime=-1&class=y&flighttype=0"
         )
         self._calendar_url = (
             "https://external.issta.co.il/products/api/flights/calendardates"
@@ -123,24 +125,31 @@ class IsstaScraper(BaseScraper):
         dt = datetime.strptime(date_iso, "%Y-%m-%d")
         fdate = dt.strftime("%d/%m/%Y")
 
-        url = f"{self._results_url}&fdate={fdate}"
-        logger.info("Fetching Issta results for %s", date_iso)
+        all_results: List[FlightResult] = []
+        for origin in ORIGINS:
+            url = f"{self._results_url_template.format(origin=origin)}&fdate={fdate}"
+            logger.info("Fetching Issta results for %s from %s", date_iso, origin.upper())
 
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=30)
+                resp.raise_for_status()
+            except Exception:
+                logger.exception("Error fetching Issta for %s from %s", date_iso, origin.upper())
+                continue
+            html = resp.text
 
-        results = self._parse_results_html(html, date_iso, url)
+            results = self._parse_results_html(html, date_iso, url, origin.upper())
 
-        # Issta groups flights: only the first is in the initial HTML,
-        # the rest are loaded via AJAX. Fetch them too.
-        additional = self._fetch_additional_flights(html, date_iso, url)
-        results.extend(additional)
+            # Issta groups flights: only the first is in the initial HTML,
+            # the rest are loaded via AJAX. Fetch them too.
+            additional = self._fetch_additional_flights(html, date_iso, url, origin.upper())
+            results.extend(additional)
+            all_results.extend(results)
 
-        return results
+        return all_results
 
     def _fetch_additional_flights(
-        self, html: str, date_iso: str, url: str,
+        self, html: str, date_iso: str, url: str, origin: str = "TLV",
     ) -> List[FlightResult]:
         """Fetch grouped flights hidden behind the 'show more' button."""
         # Extract session key
@@ -164,7 +173,7 @@ class IsstaScraper(BaseScraper):
                     timeout=30,
                 )
                 resp.raise_for_status()
-                additional = self._parse_results_html(resp.text, date_iso, url)
+                additional = self._parse_results_html(resp.text, date_iso, url, origin)
                 logger.info(
                     "Fetched %d additional flight(s) for %s (flightId=%s)",
                     len(additional), date_iso, fid,
@@ -179,7 +188,7 @@ class IsstaScraper(BaseScraper):
         return results
 
     def _parse_results_html(
-        self, html: str, date_iso: str, url: str,
+        self, html: str, date_iso: str, url: str, origin: str = "TLV",
     ) -> List[FlightResult]:
         """Parse the Issta results HTML to extract flight information."""
         results: List[FlightResult] = []
@@ -207,7 +216,7 @@ class IsstaScraper(BaseScraper):
                 # Find airline name (first occurrence only)
                 if airline is None and any(
                     a in t.lower()
-                    for a in ["israir", "arkia", "el al", "elal"]
+                    for a in ["israir", "arkia", "el al", "elal", "airhaifa", "air haifa"]
                 ):
                     airline = t
 
@@ -248,10 +257,12 @@ class IsstaScraper(BaseScraper):
                 airline = "Arkia"
             elif "el al" in airline_lower or "elal" in airline_lower:
                 airline = "El Al"
+            elif "airhaifa" in airline_lower or "air haifa" in airline_lower:
+                airline = "airHaifa"
 
             flight = FlightResult(
                 airline=airline,
-                origin="TLV",
+                origin=origin,
                 destination=self.destination,
                 date=date_iso,
                 departure_time=dep_time,
