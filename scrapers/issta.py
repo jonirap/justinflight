@@ -1,31 +1,49 @@
+import asyncio
 import logging
 import re
 from datetime import datetime
 from html.parser import HTMLParser
-from typing import List
+from typing import Dict, List, Optional
 
 import requests
+from curl_cffi import requests as cffi_requests
+from playwright.async_api import async_playwright
 
 from models import FlightResult
 from scrapers.base import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-ADDITIONAL_FLIGHTS_URL = (
-    "https://www.issta.co.il/flights/getadditionalflights"
+WANTED_AIRLINES = {"israir", "arkia", "el al", "airhaifa"}
+
+ORIGINS = ["tlv", "hfa"]
+
+STEALTH_JS = """
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, parameter);
+};
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['he-IL', 'he', 'en-US', 'en'],
+});
+window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+"""
+
+CALENDAR_URL = (
+    "https://external.issta.co.il/products/api/flights/calendardates"
 )
 
-HEADERS = {
+CALENDAR_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
 }
-
-WANTED_AIRLINES = {"israir", "arkia", "el al", "airhaifa"}
-
-ORIGINS = ["tlv", "hfa"]
 
 
 class _TextExtractor(HTMLParser):
@@ -39,13 +57,54 @@ class _TextExtractor(HTMLParser):
             self.texts.append(d)
 
 
+async def _obtain_radware_cookies() -> Dict[str, str]:
+    """Use headless Firefox to solve the Radware bot challenge and return cookies."""
+    logger.info("Obtaining Radware cookies via headless Firefox...")
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) "
+                "Gecko/20100101 Firefox/134.0"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="he-IL",
+            timezone_id="Asia/Jerusalem",
+        )
+        await context.add_init_script(STEALTH_JS)
+        page = await context.new_page()
+
+        # Load any Issta results page to trigger the challenge
+        await page.goto(
+            "https://www.issta.co.il/flights/results.aspx"
+            "?route=1&padt=1&pchd=0&pinf=0&pyou=0"
+            "&dport=tlv&aport=lca&dtime=-1&class=y&flighttype=0"
+            "&fdate=01/01/2027",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        # Wait for the challenge JS to execute and set cookies
+        await page.wait_for_timeout(15000)
+
+        cookies = await context.cookies()
+        result = {
+            c["name"]: c["value"]
+            for c in cookies
+            if "issta" in c.get("domain", "")
+        }
+        logger.info("Obtained %d Radware cookies", len(result))
+
+        await browser.close()
+    return result
+
+
 class IsstaScraper(BaseScraper):
     """Scrape Issta.co.il search results for one-way TLV/HFA flights.
 
-    The Issta results page is server-side rendered and returns full flight
-    data in the HTML without requiring JavaScript execution. We use the
-    calendar API to find dates with availability, then load the results
-    page for each date and parse the HTML.
+    Issta's results page is behind Radware Bot Manager. We use headless
+    Firefox (once per scrape session) to solve the JS challenge and obtain
+    auth cookies, then use curl_cffi with Chrome TLS impersonation to
+    fetch results pages quickly via plain HTTP.
     """
 
     airline_name = "Issta"
@@ -56,17 +115,18 @@ class IsstaScraper(BaseScraper):
         self._results_url_template = (
             "https://www.issta.co.il/flights/results.aspx"
             "?route=1&padt=1&pchd=0&pinf=0&pyou=0"
-            "&dport={origin}&aport=" + dest_lower + "&dtime=-1&class=y&flighttype=0"
+            "&dport={origin}&aport=" + dest_lower
+            + "&dtime=-1&class=y&flighttype=0"
         )
         self._calendar_url = (
-            "https://external.issta.co.il/products/api/flights/calendardates"
-            f"?destinationCode={self.destination}&from=null"
+            f"{CALENDAR_URL}?destinationCode={self.destination}&from=null"
         )
+        self._cookies: Optional[Dict[str, str]] = None
 
     async def search_flights(self, dates: List[str]) -> List[FlightResult]:
         results: List[FlightResult] = []
 
-        # First, check which of our target dates have flights available
+        # Check which target dates have flights available (no auth needed)
         available_dates = self._get_available_dates()
         target_dates = set(dates)
         dates_to_search = sorted(target_dates & available_dates)
@@ -83,6 +143,14 @@ class IsstaScraper(BaseScraper):
             len(dates_to_search), len(dates), ", ".join(dates_to_search),
         )
 
+        # Obtain Radware cookies if we don't have them yet
+        if not self._cookies:
+            try:
+                self._cookies = await _obtain_radware_cookies()
+            except Exception:
+                logger.exception("Failed to obtain Radware cookies")
+                return results
+
         for date in dates_to_search:
             try:
                 flights = self._search_date(date)
@@ -98,13 +166,17 @@ class IsstaScraper(BaseScraper):
                 seen.add(f.dedup_key)
                 unique.append(f)
 
-        logger.info("Issta scraper finished. Total: %d unique flights", len(unique))
+        logger.info(
+            "Issta scraper finished. Total: %d unique flights", len(unique),
+        )
         return unique
 
     def _get_available_dates(self) -> set[str]:
         """Query Issta calendar API to find dates with flight availability."""
         try:
-            resp = requests.get(self._calendar_url, headers=HEADERS, timeout=15)
+            resp = requests.get(
+                self._calendar_url, headers=CALENDAR_HEADERS, timeout=15,
+            )
             resp.raise_for_status()
             data = resp.json()
         except Exception:
@@ -113,90 +185,66 @@ class IsstaScraper(BaseScraper):
 
         dates = set()
         for entry in data.get("Dates", []):
-            # Date format: "2026-03-20T00:00:00"
             raw = entry.get("Date", "")
             if raw:
                 dates.add(raw[:10])  # YYYY-MM-DD
         return dates
 
     def _search_date(self, date_iso: str) -> List[FlightResult]:
-        """Load Issta results page for a specific date and parse flights."""
-        # Convert YYYY-MM-DD to DD/MM/YYYY for URL
+        """Fetch Issta results page for a date across all origins."""
         dt = datetime.strptime(date_iso, "%Y-%m-%d")
         fdate = dt.strftime("%d/%m/%Y")
 
+        session = cffi_requests.Session(impersonate="chrome120")
+        for name, value in (self._cookies or {}).items():
+            session.cookies.set(name, value, domain="www.issta.co.il")
+
         all_results: List[FlightResult] = []
         for origin in ORIGINS:
-            url = f"{self._results_url_template.format(origin=origin)}&fdate={fdate}"
-            logger.info("Fetching Issta results for %s from %s", date_iso, origin.upper())
+            url = (
+                f"{self._results_url_template.format(origin=origin)}"
+                f"&fdate={fdate}"
+            )
+            logger.info(
+                "Fetching Issta results for %s from %s", date_iso,
+                origin.upper(),
+            )
 
             try:
-                resp = requests.get(url, headers=HEADERS, timeout=30)
+                resp = session.get(url, timeout=30)
+                if resp.status_code == 247:
+                    logger.warning(
+                        "Radware challenge on %s (cookies may have expired)",
+                        origin.upper(),
+                    )
+                    self._cookies = None  # Force re-auth next time
+                    continue
                 resp.raise_for_status()
-            except Exception:
-                logger.exception("Error fetching Issta for %s from %s", date_iso, origin.upper())
-                continue
-            html = resp.text
-
-            results = self._parse_results_html(html, date_iso, url, origin.upper())
-
-            # Issta groups flights: only the first is in the initial HTML,
-            # the rest are loaded via AJAX. Fetch them too.
-            additional = self._fetch_additional_flights(html, date_iso, url, origin.upper())
-            results.extend(additional)
-            all_results.extend(results)
-
-        return all_results
-
-    def _fetch_additional_flights(
-        self, html: str, date_iso: str, url: str, origin: str = "TLV",
-    ) -> List[FlightResult]:
-        """Fetch grouped flights hidden behind the 'show more' button."""
-        # Extract session key
-        sid_match = re.search(r'name="sid"[^>]*value="([^"]+)"', html)
-        if not sid_match:
-            return []
-        session_key = sid_match.group(1)
-
-        # Extract flight IDs from hidden-items containers
-        flight_ids = re.findall(r'data-flightid="([^"]+)"', html)
-        if not flight_ids:
-            return []
-
-        results: List[FlightResult] = []
-        for fid in flight_ids:
-            try:
-                resp = requests.post(
-                    ADDITIONAL_FLIGHTS_URL,
-                    data={"sessionKey": session_key, "flightId": fid},
-                    headers={**HEADERS, "Referer": url},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                additional = self._parse_results_html(resp.text, date_iso, url, origin)
-                logger.info(
-                    "Fetched %d additional flight(s) for %s (flightId=%s)",
-                    len(additional), date_iso, fid,
-                )
-                results.extend(additional)
             except Exception:
                 logger.exception(
-                    "Error fetching additional flights for %s (flightId=%s)",
-                    date_iso, fid,
+                    "Error fetching Issta for %s from %s",
+                    date_iso, origin.upper(),
                 )
+                continue
 
-        return results
+            flights = self._parse_results_html(
+                resp.text, date_iso, url, origin.upper(),
+            )
+            all_results.extend(flights)
+
+        return all_results
 
     def _parse_results_html(
         self, html: str, date_iso: str, url: str, origin: str = "TLV",
     ) -> List[FlightResult]:
-        """Parse the Issta results HTML to extract flight information."""
+        """Parse the Issta Angular results page HTML."""
         results: List[FlightResult] = []
 
-        # Split HTML by flight result items (literal string split)
-        blocks = html.split('class="list-item result')
+        # The Angular page uses <div class="list-item "> (trailing space)
+        # for each flight. Split on that marker to isolate per-flight blocks.
+        blocks = html.split('class="list-item ')
 
-        for block in blocks[1:]:  # skip first (before any result)
+        for block in blocks[1:]:
             parser = _TextExtractor()
             try:
                 parser.feed(block[:8000])
@@ -212,35 +260,31 @@ class IsstaScraper(BaseScraper):
             price = None
             seats_left = None
 
-            for i, t in enumerate(texts):
-                # Find airline name (first occurrence only)
-                if airline is None and any(
-                    a in t.lower()
-                    for a in ["israir", "arkia", "el al", "elal", "airhaifa", "air haifa"]
-                ):
-                    airline = t
+            for t in texts:
+                # Airline name: first text token matching a known airline
+                if airline is None:
+                    tl = t.lower()
+                    if any(a in tl for a in [
+                        "israir", "arkia", "el al", "elal",
+                        "airhaifa", "air haifa",
+                    ]):
+                        airline = t
 
-                # Find departure time (HH:MM pattern, first occurrence)
-                # Handle "(+1)" marker before time for overnight flights
+                # Departure time (HH:MM)
                 if dep_time is None and re.match(r"^\d{1,2}:\d{2}$", t):
                     dep_time = t
 
-                # Find price: look for "סה"כ לתשלום:" followed by "$NNN"
+                # Total price: "סה"כ לתשלום: $NNN" → the $NNN token
                 if price is None and re.match(r"^\$\d+", t):
                     price = t
 
-                # Find seats remaining: "N מקומות אחרונים"
+                # Seats remaining: "N מקומות אחרונים" or "מקום אחרון"
                 if seats_left is None:
-                    seats_match = re.match(r"^(\d+)\s+מקומות", t)
+                    seats_match = re.match(r"^(\d+)\s+מקומו?ת", t)
                     if seats_match:
                         seats_left = seats_match.group(1)
-
-            # Also try: "$" as separate token followed by number
-            if price is None:
-                for i, t in enumerate(texts):
-                    if t == "$" and i + 1 < len(texts) and texts[i + 1].isdigit():
-                        price = f"${texts[i + 1]}"
-                        break
+                    elif "מקום אחרון" in t:
+                        seats_left = "1"
 
             if not airline:
                 continue
@@ -273,8 +317,8 @@ class IsstaScraper(BaseScraper):
             )
             results.append(flight)
             logger.info(
-                "Found %s flight: %s dep %s price %s",
-                airline, date_iso, dep_time, price,
+                "Found %s flight: %s dep %s price %s seats %s",
+                airline, date_iso, dep_time, price, seats_left,
             )
 
         return results
