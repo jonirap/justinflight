@@ -58,6 +58,10 @@ def find_destination(query: str) -> str | None:
         if q in info["country"].lower():
             return code
 
+    # Accept any 3-letter string as a potential IATA airport code
+    if len(upper) == 3 and upper.isalpha():
+        return upper
+
     return None
 
 

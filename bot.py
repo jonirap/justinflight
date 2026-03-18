@@ -88,12 +88,19 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     code = find_destination(query)
     if not code:
-        await update.message.reply_text(f"Unknown destination: {query}\nUse /destinations to see the list.")
+        await update.message.reply_text(
+            f"Invalid destination: {query}\n"
+            "Use /destinations to see known destinations, "
+            "or provide a 3-letter IATA airport code directly."
+        )
         return
 
     added = await prefs.add_destination(chat_id, code)
     if added:
-        await update.message.reply_text(f"Subscribed to {destination_display(code)}!")
+        note = ""
+        if code not in DESTINATIONS:
+            note = f"\nNote: {code} is not a known destination — flights may not be available."
+        await update.message.reply_text(f"Subscribed to {destination_display(code)}!{note}")
     else:
         await update.message.reply_text(f"Already subscribed to {destination_display(code)}.")
 
@@ -109,7 +116,10 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     code = find_destination(query)
     if not code:
-        await update.message.reply_text(f"Unknown destination: {query}\nUse /destinations to see the list.")
+        await update.message.reply_text(
+            f"Invalid destination: {query}\n"
+            "Use a city name or 3-letter IATA airport code."
+        )
         return
 
     removed = await prefs.remove_destination(chat_id, code)
