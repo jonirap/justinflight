@@ -26,6 +26,9 @@ DESTINATIONS = {
     "FCO": {"name": "Rome", "country": "Italy"},
     "MXP": {"name": "Milan", "country": "Italy"},
     "VCE": {"name": "Venice", "country": "Italy"},
+    "BER": {"name": "Berlin", "country": "Germany"},
+    "FRA": {"name": "Frankfurt", "country": "Germany"},
+    "MUC": {"name": "Munich", "country": "Germany"},
 }
 
 
