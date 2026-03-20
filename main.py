@@ -7,7 +7,7 @@ from dedup import DedupTracker
 from models import FlightResult
 from notifier import escape_markdown_v2, notify_flights_to_chat, send_to_chat
 from preferences import UserPreferences
-from scrapers import IsstaScraper
+from scrapers import ElAlScraper, IsstaScraper
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -18,7 +18,7 @@ logger = logging.getLogger("justinflight")
 
 
 def _scrape_destination(dest: str, dates: list[str]) -> tuple[list[FlightResult], bool]:
-    """Run scraper synchronously (called via asyncio.to_thread).
+    """Run Issta scraper synchronously (called via asyncio.to_thread).
 
     Returns (flights, sanity_ok) where sanity_ok indicates whether the
     parser sanity check passed.
@@ -28,6 +28,13 @@ def _scrape_destination(dest: str, dates: list[str]) -> tuple[list[FlightResult]
     flights = asyncio.run(scraper.search_flights(dates))
     sanity_ok = scraper.sanity_check()
     return flights, sanity_ok
+
+
+def _scrape_elal(dest: str, dates: list[str]) -> list[FlightResult]:
+    """Run El Al scraper synchronously (called via asyncio.to_thread)."""
+    scraper = ElAlScraper(dest)
+    import asyncio
+    return asyncio.run(scraper.search_flights(dates))
 
 
 async def run_check(
@@ -45,22 +52,22 @@ async def run_check(
 
     logger.info("Checking %d destination(s): %s", len(wanted_dests), ", ".join(sorted(wanted_dests)))
 
+    # Compute dates per destination upfront
+    dest_dates: dict[str, list[str]] = {}
+    for dest in sorted(wanted_dests):
+        users = preferences.get_users_for_destination(dest)
+        all_dates: set[str] = set()
+        for uid in users:
+            all_dates.update(preferences.get_dates_for_user(uid, rolling_dates))
+        if all_dates:
+            dest_dates[dest] = sorted(all_dates)
+
     # Scrape each destination (in a thread to avoid blocking the event loop)
     dest_flights: dict[str, list[FlightResult]] = {}
-    for dest in sorted(wanted_dests):
+    for dest, dates in dest_dates.items():
         scraper_key = f"Issta-{dest}"
         try:
-            # Compute union of dates across all users wanting this destination
-            users = preferences.get_users_for_destination(dest)
-            all_dates: set[str] = set()
-            for uid in users:
-                all_dates.update(preferences.get_dates_for_user(uid, rolling_dates))
-            dates = sorted(all_dates)
-
-            if not dates:
-                continue
-
-            logger.info("Running scraper for %s with %d date(s)", dest, len(dates))
+            logger.info("Running Issta scraper for %s with %d date(s)", dest, len(dates))
             flights, sanity_ok = await asyncio.to_thread(_scrape_destination, dest, dates)
             logger.info("%s returned %d flight(s)", scraper_key, len(flights))
             dest_flights[dest] = flights
@@ -92,7 +99,6 @@ async def run_check(
                 logger.warning(
                     "%s scraper has failed 5 consecutive times", scraper_key,
                 )
-                # Notify all users subscribed to this destination
                 users = preferences.get_users_for_destination(dest)
                 msg = escape_markdown_v2(
                     f"Warning: scraper for {dest} has failed 5 consecutive times. "
@@ -100,6 +106,31 @@ async def run_check(
                 )
                 for uid in users:
                     await asyncio.to_thread(send_to_chat, uid, msg)
+
+    # Run El Al scraper (single API call covers all destinations)
+    elal_key = "ElAl"
+    try:
+        # Pick any destination to trigger the shared API fetch, then scrape each
+        all_elal_dates = set()
+        for dates in dest_dates.values():
+            all_elal_dates.update(dates)
+        all_elal_dates_sorted = sorted(all_elal_dates)
+
+        if all_elal_dates_sorted:
+            for dest in dest_dates:
+                elal_flights = await asyncio.to_thread(
+                    _scrape_elal, dest, all_elal_dates_sorted,
+                )
+                if elal_flights:
+                    logger.info("El Al returned %d flight(s) for %s",
+                                len(elal_flights), dest)
+                    dest_flights.setdefault(dest, []).extend(elal_flights)
+            failure_counts[elal_key] = 0
+    except Exception:
+        logger.exception("El Al scraper failed")
+        failure_counts[elal_key] = failure_counts.get(elal_key, 0) + 1
+        if failure_counts[elal_key] == 5:
+            logger.warning("El Al scraper has failed 5 consecutive times")
 
     # Per-user notification with dedup
     all_chat_ids = preferences.get_all_chat_ids()

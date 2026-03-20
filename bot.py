@@ -11,16 +11,19 @@ from dedup import DedupTracker
 from destinations import DESTINATIONS, destination_display, find_destination
 from notifier import escape_markdown_v2, format_flights_message
 from preferences import UserPreferences
-from scrapers import IsstaScraper
+from scrapers import ElAlScraper, IsstaScraper
 
 logger = logging.getLogger(__name__)
 
 
 def _scrape_sync(dest: str, dates: list[str]):
-    """Run scraper synchronously (for use with asyncio.to_thread)."""
+    """Run scrapers synchronously (for use with asyncio.to_thread)."""
     import asyncio as _asyncio
-    scraper = IsstaScraper(dest)
-    return _asyncio.run(scraper.search_flights(dates))
+    issta = IsstaScraper(dest)
+    elal = ElAlScraper(dest)
+    flights = _asyncio.run(issta.search_flights(dates))
+    flights.extend(_asyncio.run(elal.search_flights(dates)))
+    return flights
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
